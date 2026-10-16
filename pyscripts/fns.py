@@ -12,62 +12,9 @@ from scipy.stats import mannwhitneyu
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
 import ast
-
-# loop through the patients. needs to extract the defined features. needs to return the relevant patient feature_table X and corresponding outcome_table Y. 
-# Needs to return X, Y, feature_names, patient number
-
-def create_feature_table(dataset: Dict, comb: str):
-    # loop through dataset
-    comb_list = comb.split('_')
-    feature_objects = []
-    extractor = featureextractor.RadiomicsFeatureExtractor()
-    statrad = StaticRadiomics(extractor)
-    multirad = MultiphaseRadiomics(statrad)
-    timeseriesrad = TimeSeriesRadiomics(multirad)
-    engineeredrad = EngineeredTempRadiomics(multirad)
-
-    if "S" in comb_list:
-        feature_objects.append(statrad)
-    if "M" in comb_list:
-        feature_objects.append(multirad)
-        if "S" in comb_list:
-            feature_objects.remove(statrad)
-    if "E" in comb_list:
-        feature_objects.append(engineeredrad)
-    if "T" in comb_list:
-        feature_objects.append(timeseriesrad)
-    x = []
-    y = []
-    feature_names = None
-    patient_ids = []
-
-    for patient_id, patient in dataset.items():
-        if "M" in comb_list or "E" in comb_list or "T" in comb_list: # since E and T depend on M extracting (for the time series table)
-            multirad.extract(patient["images"], patient["mask"])
-        if "S" in comb_list and "M" not in comb_list: #extracts the single phase radiomics
-            statrad.extract(patient["images"]["1"], patient["mask"]) #patient["phase1"] as placeholder logic for grabbing the decided phase. 
-        if "E" in comb_list:
-            engineeredrad.apply_time_res(patient["time_res"])
-
-        patient_vector = []
-        total_feature_names = []
-        for feature_object in feature_objects:
-            vector, names = feature_object.get_feature_vector()
-            patient_vector.extend(vector)
-            total_feature_names.extend(names)
-
-        if feature_names is None:   
-            feature_names = total_feature_names
-        else:
-            assert feature_names == total_feature_names, "There are missing features"
-
-        x.append(patient_vector) #patient_vector is a row, so this results in 2D array as wanted. 
-        y.append(patient["pcr"])
-        patient_ids.append(patient_id)
-    x = np.array(x, dtype=np.float32)
-    y = np.array(y)
-
-    return x, y, feature_names, patient_ids
+import gzip
+import shutil
+import tempfile
 
 def variancefilter(x, feature_names, threshold: float=0.0): # helper function to use sklearn variance filter
     vf = VarianceThreshold(threshold=threshold) # transforms across the columns, as we would want (variance along the same feature across the patients)
@@ -136,39 +83,115 @@ def filter_train_data(x, y, feature_names, k):
     x_filtered, scalerobject = normalisetransform(x_filtered)
     return x_filtered, feature_names_filtered, vf, retain, selector, scalerobject # feed vf, retain, scalerobject directly into filter_test_data
 
-def phase_number(path):
-    return int(path.stem.rsplit("_", 1)[-1])
+def phase_number(path, comp): #comp for compressed files. because .nii.gz
+    suffix = ".nii.gz" if comp else ".nii"
+    stem = path.name.removesuffix(suffix)
+    return int(stem.rsplit("_", 1)[-1])
 
 def get_patient_id(path):
-    return str(path.stem.rsplit("_", 1)[0])
+    return path.name.removesuffix("_data")
 
-def dataset_loader(dataset_name: str, num_phases: int, datapath: Path, clinpath: Path): # clinroot is the path to the sheet that contains all the clinical data, including pcr. dataset is the dataset name e.g. NACT for the NACT pilot
+def read_nifti(path: Path): #this is needed currently because I am using compressed files. 
+    try:
+        return sitk.ReadImage(str(path)) #this just does 'normal' way
+    except RuntimeError as error:
+        if (not path.name.lower().endswith(".nii.gz") or "nifti_image_load failed" not in str(error)):
+            raise # so that if the issue is with the image rather than it being compressed, then it raises error
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as temp_file:
+                temp_path = Path(temp_file.name)
+                with gzip.open(path, "rb") as compressed_file:
+                    shutil.copyfileobj(compressed_file, temp_file, length=1024*1024)
+
+            return sitk.ReadImage(str(temp_path))
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True) #deletes the temporary .nii file
+                # missing_ok=True just says to not raise error if the file is already gone
+                # happens in finally so it happens whether sitk.ReadImge() works not throws error
+
+def build_feature_table(dataset_name: str, num_phases: int, datapath: Path, clinpath: Path, comb: str, preprocess: bool, comp: bool=False): # clinroot is the path to the sheet that contains all the clinical data, including pcr. dataset is the dataset name e.g. NACT for the NACT pilot
+    comb_list = comb.split('_')
+    feature_objects = []
+    extractor = featureextractor.RadiomicsFeatureExtractor()
+    statrad = StaticRadiomics(extractor)
+    multirad = MultiphaseRadiomics(statrad)
+    timeseriesrad = TimeSeriesRadiomics(multirad)
+    engineeredrad = EngineeredTempRadiomics(multirad)
+
+    if "S" in comb_list:
+        feature_objects.append(statrad)
+    if "M" in comb_list:
+        feature_objects.append(multirad)
+        if "S" in comb_list:
+            feature_objects.remove(statrad)
+    if "E" in comb_list:
+        feature_objects.append(engineeredrad)
+    if "T" in comb_list:
+        feature_objects.append(timeseriesrad)
+    x = []
+    y = []
+    feature_names = None
+    patient_ids = []
     # this function needs to pull the data, and save it into something that can plug into the featurevectors.py classes.
     # this means that patient: {'images': all phase images {"phase_0": image_0, etc etc}, 'mask': mask image, 'pcr': 0 or 1, }
     # each image and mask must be a simple itk Image object
-    dataset = defaultdict()
     clinical_information = pd.read_excel(clinpath, index_col=0)
     for patient in datapath.glob(f"{dataset_name}_*"):
-        patient_info = defaultdict()
+        
+        images = defaultdict()
+        
         patient_id = get_patient_id(patient) # example output would be "NACT_01"
 
-        phase_paths = sorted(patient.glob(f"{patient_id}_*.nii"), key=phase_number) # ensures that they are sorted based on phase
+        if "E" in comb_list:
+            # the following is needed to exclude the patients without acquisition times from the ENTIRE dataset so E can be used.
+            if pd.isna(clinical_information.loc[patient_id, "acquisition_times"]):
+                continue
+            time_res = ast.literal_eval(clinical_information.loc[patient_id, "acquisition_times"])  
+            engineeredrad.apply_time_res(time_res)
+
+        phase_paths = sorted(patient.glob(f"{patient_id}_*.nii.gz"), key=lambda path: phase_number(path, comp)) # ensures that they are sorted based on phase
         if len(phase_paths) != num_phases:
             continue
 
-        patient_info['images'] = defaultdict()
         for phase_path in phase_paths:
-            patient_info['images'][str(phase_number(phase_path))] = sitk.ReadImage(str(phase_path))
+            images[str(phase_number(phase_path, comp))] = read_nifti(phase_path)
 
-        patient_info['mask'] = sitk.ReadImage(str(patient / 'mask.nii'))
+        mask = read_nifti(patient / 'mask.nii.gz')
 
-        patient_info['pcr'] = clinical_information.loc[patient_id, "pcr"]
+        if preprocess:
+            images, mask = data_preprocess(images, mask)
 
-        patient_info['time_res'] = ast.literal_eval(clinical_information.loc[patient_id, "acquisition_times"])
+        if "M" in comb_list or "E" in comb_list or "T" in comb_list: # since E and T depend on M extracting (for the time series table)
+            multirad.extract(images, mask)
+        if "S" in comb_list and "M" not in comb_list: #extracts the single phase radiomics
+            statrad.extract(images["1"], mask) #patient["phase1"] as placeholder logic for grabbing the decided phase. 
 
-        dataset[patient_id] = patient_info
 
-    return dataset
+        del images
+        del mask
+
+        pcr = clinical_information.loc[patient_id, "pcr"]
+
+        patient_vector = []
+        total_feature_names = []
+        for feature_object in feature_objects:
+            vector, names = feature_object.get_feature_vector()
+            patient_vector.extend(vector)
+            total_feature_names.extend(names)
+
+        if feature_names is None:   
+            feature_names = total_feature_names
+        else:
+            assert feature_names == total_feature_names, "There are missing features"
+
+        x.append(patient_vector) #patient_vector is a row, so this results in 2D array as wanted. 
+        y.append(pcr)
+        patient_ids.append(patient_id)
+
+    return np.array(x, dtype=np.float32), np.array(y, dtype=np.float32), feature_names, patient_ids
 
 def n4_correction(image): # image being a simple itk readimage object
     image = sitk.Cast(image, sitk.sitkFloat32)
@@ -214,16 +237,13 @@ def z_score_image_normalise(images: Dict): # images are stored as a dictionary u
 
     return normalised
 
-def data_preprocess(dataset):
+def data_preprocess(images: Dict, mask):
     # dataset is the dictionary with all the patients in it as keys
-    for patient, patient_info in dataset.items():
-        images = patient_info['images']
-        mask = patient_info['mask']
-        corrected_images = {phase_name: n4_correction(image) for phase_name, image in images.items()}
-        resampled_images = {phase_name: resample(image) for phase_name, image in corrected_images.items()}
-        r_mask = resample(mask, is_mask=True)
+    corrected_images = {phase_name: n4_correction(image) for phase_name, image in images.items()}
+    resampled_images = {phase_name: resample(image) for phase_name, image in corrected_images.items()}
+    r_mask = resample(mask, is_mask=True)
 
-        patient_info['images'] = z_score_image_normalise(resampled_images)
-        patient_info['mask'] = r_mask
+    preprocessed_images = z_score_image_normalise(resampled_images)
+    preprocessed_mask = r_mask
 
-    return dataset
+    return preprocessed_images, preprocessed_mask
