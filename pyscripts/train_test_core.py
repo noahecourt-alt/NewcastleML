@@ -1,4 +1,4 @@
-from fns import create_feature_table, filter_test_data, filter_train_data, dataset_loader, data_preprocess
+from fns import build_feature_table, filter_test_data, filter_train_data, data_preprocess
 from featurevectors import StaticRadiomics, MultiphaseRadiomics, EngineeredTempRadiomics, TimeSeriesRadiomics
 from pathlib import Path
 
@@ -10,10 +10,11 @@ import pysera
 
 
 def main():
-    datapath = Path("../breast1/NACT_extracted")
+    #datapath = Path("../breast1/NACT_extracted")
+    datapath = Path("../MAMA_MIA_ISPY2/images")
     clinpath = Path("../clinical_and_imaging_info.xlsx")
-    dataset = dataset_loader(dataset_name="NACT", num_phases=3, datapath=datapath, clinpath=clinpath)
-    #dataset = data_preprocess(dataset=dataset)
+    comb = "S"
+    preprocess = False
     #print(dataset["NACT_01"]["time_res"])
     # grid search of C for tuning
 
@@ -21,7 +22,7 @@ def main():
     ks = [5, 10, 25, 50]
 
 
-    x, y, feature_names, patient_ids = create_feature_table(dataset=dataset, comb="S")
+    x, y, feature_names, patient_ids = build_feature_table(dataset_name="ispy2", num_phases=6, datapath=datapath, clinpath=clinpath, comb=comb, preprocess=preprocess, comp=True)
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     lst_accu_stratified = []
@@ -32,7 +33,7 @@ def main():
         x_train_fold, x_test_fold = x[train_index], x[test_index]
         y_train_fold, y_test_fold = y[train_index], y[test_index]
 
-        x_train_fold, feature_names_filtered, vf, retain, selector, scalerobject = filter_train_data(x_train_fold, y_train_fold, feature_names=feature_names, k=3)
+        x_train_fold, feature_names_filtered, vf, retain, selector, scalerobject = filter_train_data(x_train_fold, y_train_fold, feature_names=feature_names, k=25)
         x_test_fold = filter_test_data(x_test_fold, vf_object=vf, retain_matrix=retain, selector_object=selector, scaler_object=scalerobject)
 
         print("selected features: ", feature_names_filtered)
